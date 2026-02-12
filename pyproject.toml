@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "odil-spectral"
+version = "0.1.0"
+description = "JAX implementation for spectral odil methods"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4",
+    "jaxlib>=0.4",
+    "jaxopt>=0.8",
+    "optax>=0.2",
+]
+
+[project.optional-dependencies]
+plot = [
+    "matplotlib>=3.7",
+]
+dev = [
+    "matplotlib>=3.7",
+    "pytest>=7",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
