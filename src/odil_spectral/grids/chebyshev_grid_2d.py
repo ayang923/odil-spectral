@@ -92,8 +92,8 @@ class ChebyshevGrid2D:
         """
 
         # Differentiate along y (axis 0): vmap over columns
-        dc_dx = self._du_dx_coeff(cheb_coeffs)
-        dc_dy = self._du_dy_coeff(cheb_coeffs)
+        dc_dx = self.du_dx_coeff(cheb_coeffs)
+        dc_dy = self.du_dy_coeff(cheb_coeffs)
 
         du_dx = self.eval_function(dc_dx)
         du_dy = self.eval_function(dc_dy)
@@ -114,12 +114,12 @@ class ChebyshevGrid2D:
         """
         Evaluate the Laplacian on the grid.
         """
-        d2c_dx2 = self._du_dx_coeff(self._du_dx_coeff(cheb_coeffs))
-        d2c_dy2 = self._du_dy_coeff(self._du_dy_coeff(cheb_coeffs))
+        d2c_dx2 = self.du_dx_coeff(self.du_dx_coeff(cheb_coeffs))
+        d2c_dy2 = self.du_dy_coeff(self.du_dy_coeff(cheb_coeffs))
 
         return self.eval_function(d2c_dx2 + d2c_dy2)
 
-    def _du_dx_coeff(self, cheb_coeffs: jnp.ndarray):
+    def du_dx_coeff(self, cheb_coeffs: jnp.ndarray):
         """
         Differentiate Chebyshev coefficients along x (axis 1), including
         the reference-to-physical scaling: dt/dx = -2/(x_end - x_start).
@@ -127,7 +127,7 @@ class ChebyshevGrid2D:
         return jax.vmap(_cheb_diff_1d)(cheb_coeffs) * (-2.0 / (self.x_end - self.x_start))
 
 
-    def _du_dy_coeff(self, cheb_coeffs: jnp.ndarray):
+    def du_dy_coeff(self, cheb_coeffs: jnp.ndarray):
         """
         Differentiate Chebyshev coefficients along y (axis 0), including
         the reference-to-physical scaling: dt/dy = -2/(y_end - y_start).
