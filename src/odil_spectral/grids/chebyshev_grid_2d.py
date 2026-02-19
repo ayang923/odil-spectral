@@ -1,8 +1,6 @@
 import jax.numpy as jnp
 import jax
 
-
-
 class ChebyshevGrid2D:
     """Chebyshev grid on [x_start, x_end] x [y_start, y_end]."""
 
@@ -134,6 +132,105 @@ class ChebyshevGrid2D:
         """
         return jax.vmap(_cheb_diff_1d)(cheb_coeffs.T).T * (-2.0 / (self.y_end - self.y_start))
 
+class ChebyshevGrid1D:
+    """Chebyshev grid on [x_start, x_end]."""
+
+    def __init__(self, x_start: float, x_end: float, n_x: int, dtype=jnp.float64):
+        self.x_start = x_start
+        self.x_end = x_end
+        self.n_x = n_x
+        self.dtype = dtype
+
+        self.N_x = n_x - 1
+
+        # Uniform theta grids (Chebyshev-Lobatto): k = 0, 1, ..., N
+        self.theta_x = (jnp.pi * jnp.arange(n_x) / self.N_x).astype(dtype)
+
+        # 1-D Chebyshev-Lobatto nodes on [-1, 1], endpoints included
+        self._nodes_x_ref = jnp.cos(self.theta_x)  # descending
+
+        # Map to physical domain: t in [-1,1] -> a + (b-a)*(1-t)/2
+        self.nodes_x = (x_start + (x_end - x_start) * (1 - self._nodes_x_ref) / 2).astype(dtype)
+
+        self._norm_x = jnp.ones(self.n_x).at[0].set(2.0).at[self.N_x].set(2.0) * self.N_x
+
+        # Clenshaw-Curtis quadrature weights (on physical domain)
+        self.quadrature_weights_x = (_clenshaw_curtis_weights(n_x) * (x_end - x_start) / 2.0).astype(dtype)
+
+    def interpolation_matrix(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Compute the data evaluation matrix for the given data points (x, y).
+
+        Entry (i, j) = T_{l}(y_ref_i) * T_{k}(x_ref_i)
+        where j = l * n_x + k is the flattened index over the 2D
+        Chebyshev basis {T_l(y) T_k(x)}, l=0..n_y-1, k=0..n_x-1.
+        This matches the (n_y, n_x) layout from meshgrid with indexing='xy'.
+
+        Parameters
+        ----------
+        x : (n_data,) array — physical x-coordinates of data points
+
+        Returns
+        -------
+        A : (n_data, n_x) array
+        """
+        # Map physical coords to reference [-1, 1]
+        x_ref = 1.0 - 2.0 * (x - self.x_start) / (self.x_end - self.x_start)
+
+        # Evaluate all 1D Chebyshev polynomials via recurrence:
+        #   T_0(x) = 1,  T_1(x) = x,  T_{k+1}(x) = 2x T_k(x) - T_{k-1}(x)
+        Tx = _cheb_eval_all(x_ref, self.n_x)   # (n_data, n_x)
+
+        A = Tx
+
+        return A.astype(self.dtype)
+
+    def compute_coeffs(self, f_grid: jnp.ndarray) -> jnp.ndarray:
+        return dct1_nd(f_grid) / self._norm_x
+
+    def eval_function(self, cheb_coeffs: jnp.ndarray) -> jnp.ndarray:
+        return idct1_nd(cheb_coeffs * self._norm_x)
+
+    def eval_gradient(self, cheb_coeffs: jnp.ndarray):
+        """
+        Differentiate in Chebyshev coefficient space via backward recurrence,
+        then evaluate on grid via eval_function.
+
+        Returns
+        -------
+        du_dx : (n_x) array of physical-space derivatives
+        """
+
+        # Differentiate along y (axis 0): vmap over columns
+        dc_dx = self.du_dx_coeff(cheb_coeffs)
+        du_dx = self.eval_function(dc_dx)
+
+        return du_dx
+
+    def pad_coeffs(self, cheb_coeffs: jnp.ndarray, rho: int):
+        """
+        Pad the Chebyshev coefficients with zeros for a prescribed refinement factor.
+        The old Nyquist modes (last row/col) are doubled because they move from
+        endpoint (c_k=2) to interior (c_k=1) in the finer basis.
+        """
+        n_x = cheb_coeffs.shape[0]
+        padded = jnp.zeros((self.N_x * rho + 1))
+        return padded.at[:n_x].set(cheb_coeffs)
+
+    def eval_laplacian(self, cheb_coeffs: jnp.ndarray):
+        """
+        Evaluate the Laplacian on the grid.
+        """
+        d2c_dx2 = self.du_dx_coeff(self.du_dx_coeff(cheb_coeffs))
+
+        return self.eval_function(d2c_dx2)
+
+    def du_dx_coeff(self, cheb_coeffs: jnp.ndarray):
+        """
+        Differentiate Chebyshev coefficients along x, including
+        the reference-to-physical scaling: dt/dx = -2/(x_end - x_start).
+        """
+        return _cheb_diff_1d(cheb_coeffs) * (-2.0 / (self.x_end - self.x_start))
 
 def dct1_axis(x: jnp.ndarray, axis: int = -1) -> jnp.ndarray:
     """
