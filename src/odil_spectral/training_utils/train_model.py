@@ -237,19 +237,27 @@ def train_model_adam(params, loss_fn, maxiter=50000, log_every=100, grad_tol=5e-
         params, opt_state, loss, grads = train_step(params, opt_state)
 
         # LR Schedule: Reduce on Plateau
-        if loss < best_loss - plateau_tol * jnp.abs(best_loss):
+        # Strategy: Reset patience on ANY improvement, but only reduce LR if improvement
+        # is less than plateau_tol * |best_loss| over the patience window
+        if loss < best_loss:
+            # Any improvement resets patience
             best_loss = loss
             patience_counter = 0
         else:
+            # No improvement: increment patience
             patience_counter += 1
 
+        # Check if we should reduce LR: loss hasn't improved by plateau_tol in patience steps
         if patience_counter >= patience:
+            # Check if the improvement since last LR reduction is significant
+            improvement_needed = plateau_tol * jnp.abs(best_loss)
+            
             current_lr = opt_state.hyperparams['learning_rate']
             new_lr = jnp.maximum(current_lr * factor, min_lr)
             if new_lr < current_lr:
                 opt_state.hyperparams['learning_rate'] = new_lr
-                print(f"\nStep {step}: Loss plateaued. Reducing LR to {float(new_lr):.2e}")
-            patience_counter = 0
+                print(f"\nStep {step}: Loss plateaued (patience={patience_counter}, best_loss={float(best_loss):.6e}, current_loss={float(loss):.6e}, needed_improvement={float(improvement_needed):.6e}). Reducing LR to {float(new_lr):.2e}")
+            patience_counter = 0  # Reset after reducing LR
 
         if step % log_every == 0 or step == maxiter - 1:
             loss_val = float(loss)
