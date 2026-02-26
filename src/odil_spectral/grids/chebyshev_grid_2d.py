@@ -73,6 +73,56 @@ class ChebyshevGrid2D:
 
         return A.astype(self.dtype)
 
+    def make_evaluation_operator(self, x_eval, y_eval):
+        x_ref = 1.0 - 2.0 * (x_eval - self.x_start) / (self.x_end - self.x_start)
+        y_ref = 1.0 - 2.0 * (y_eval - self.y_start) / (self.y_end - self.y_start)
+
+        def barycentric_weights_chebyshev(n):
+            w = jnp.ones(n)
+            w = w.at[0].set(0.5)
+            w = w.at[-1].set(0.5)
+            signs = jnp.array([(-1)**i for i in range(n)])
+            return w * signs
+
+        w1 = barycentric_weights_chebyshev(len(self._nodes_x_ref))  # x-weights (n_x,)
+        w2 = barycentric_weights_chebyshev(len(self._nodes_y_ref))  # y-weights (n_y,)
+
+        def barycentric_interpolate(x_nodes, f_nodes, x_eval, weights):
+            # x_eval: (p,), x_nodes: (n,), f_nodes: (n,)
+            diff = x_eval[:, None] - x_nodes[None, :]
+            exact = jnp.abs(diff) < 1e-14
+            diff = jnp.where(exact, 1.0, diff)
+            w_over_d = weights[None, :] / diff
+            numerator = w_over_d @ f_nodes
+            denominator = jnp.sum(w_over_d, axis=1)
+            result = numerator / denominator
+            exact_idx = jnp.argmax(exact, axis=1)
+            hit_any = jnp.any(exact, axis=1)
+            return jnp.where(hit_any, f_nodes[exact_idx], result)
+
+        def evaluation_operator(val_cheb_grid):
+            """
+            val_cheb_grid: (n_y, n_x)
+            returns: (p,) values at paired points (x_ref[k], y_ref[k])
+            """
+            # 1) Interpolate in y for each x-column: (n_y,n_x) -> (p,n_x)
+            # vmap over x-columns (axis=1)
+            f_y = jax.vmap(
+                lambda col: barycentric_interpolate(self._nodes_y_ref, col, y_ref, w2),
+                in_axes=1,   # take val_cheb_grid[:, j]
+                out_axes=1
+            )(val_cheb_grid)  # (p, n_x)
+
+            # 2) For each paired point k, interpolate in x along row f_y[k, :]
+            result = jax.vmap(
+                lambda row_k, xk: barycentric_interpolate(self._nodes_x_ref, row_k, jnp.array([xk]), w1)[0],
+                in_axes=(0, 0)
+            )(f_y, x_ref)  # (p,)
+
+            return result
+
+        return evaluation_operator
+
     def compute_coeffs(self, f_grid: jnp.ndarray) -> jnp.ndarray:
         return dct1_nd(f_grid) / (self._norm_y[:, None] * self._norm_x[None, :])
 
@@ -379,10 +429,9 @@ def _cheb_diff_1d(a: jnp.ndarray) -> jnp.ndarray:
     b = jnp.concatenate([jnp.flip(b_rest), jnp.array([b_Nm1, b_N])])
     return b
 
-
-
 if __name__ == "__main__":
     import time
+    jax.config.update("jax_enable_x64", True)
 
     u = lambda x, y: jnp.exp(x) * jnp.exp(y)
     du_dx_exact = lambda x, y: jnp.exp(x) * jnp.exp(y)
@@ -408,21 +457,3 @@ if __name__ == "__main__":
     grid_fine = ChebyshevGrid2D(0.0, 1.0, 0.0, 1.0, 32, 64)
     t1 = time.perf_counter()
     print(f"Fine grid construction: {t1 - t0:.6f} s")
-
-    t0 = time.perf_counter()
-    A = grid.interpolation_matrix(grid_fine.X.ravel(), grid_fine.Y.ravel())
-    A.block_until_ready()
-    t1 = time.perf_counter()
-    print(f"interpolation_matrix:   {t1 - t0:.6f} s")
-
-    t0 = time.perf_counter()
-    u_fine = A @ cheb_coeffs.ravel()
-    u_fine.block_until_ready()
-    t1 = time.perf_counter()
-    print(f"A @ coeffs (interp):    {t1 - t0:.6f} s  | max err = {jnp.max(jnp.abs(u_fine.reshape(grid_fine.X.shape) - u(grid_fine.X, grid_fine.Y))):.2e}")
-
-    t0 = time.perf_counter()
-    du_dx_recovered, du_dy_recovered = grid.eval_gradient(cheb_coeffs)
-    du_dx_recovered.block_until_ready()
-    t1 = time.perf_counter()
-    print(f"eval_gradient:          {t1 - t0:.6f} s  | max err dx = {jnp.max(jnp.abs(du_dx_recovered - du_dx_exact(grid.X, grid.Y))):.2e}, dy = {jnp.max(jnp.abs(du_dy_recovered - du_dy_exact(grid.X, grid.Y))):.2e}")
