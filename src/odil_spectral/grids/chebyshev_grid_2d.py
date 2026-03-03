@@ -90,7 +90,7 @@ class ChebyshevGrid2D:
         def barycentric_interpolate(x_nodes, f_nodes, x_eval, weights):
             # x_eval: (p,), x_nodes: (n,), f_nodes: (n,)
             diff = x_eval[:, None] - x_nodes[None, :]
-            exact = jnp.abs(diff) < 1e-14
+            exact = jnp.abs(diff) < 1e-12
             diff = jnp.where(exact, 1.0, diff)
             w_over_d = weights[None, :] / diff
             numerator = w_over_d @ f_nodes
@@ -148,15 +148,19 @@ class ChebyshevGrid2D:
 
         return du_dx, du_dy
 
-    def pad_coeffs(self, cheb_coeffs: jnp.ndarray, rho: int):
+    def pad_coeffs(self, cheb_coeffs, n_y_new, n_x_new):
+        assert(n_x_new >= self.n_x and n_y_new >= self.n_y)
+        padded = jnp.zeros((n_y_new, n_x_new)).at[:self.n_y, :self.n_x].set(cheb_coeffs)
+
+        return padded
+    
+    def pad_coeffs_rho(self, cheb_coeffs: jnp.ndarray, rho: int):
         """
         Pad the Chebyshev coefficients with zeros for a prescribed refinement factor.
         The old Nyquist modes (last row/col) are doubled because they move from
         endpoint (c_k=2) to interior (c_k=1) in the finer basis.
         """
-        n_y, n_x = cheb_coeffs.shape
-        padded = jnp.zeros((self.N_y * rho + 1, self.N_x * rho + 1))
-        return padded.at[:n_y, :n_x].set(cheb_coeffs)
+        return self.pad_coeffs(cheb_coeffs, self.N_y * rho + 1, self.N_x * rho + 1)
 
     def eval_laplacian(self, cheb_coeffs: jnp.ndarray):
         """
@@ -260,12 +264,16 @@ class ChebyshevGrid1D:
     def pad_coeffs(self, cheb_coeffs: jnp.ndarray, rho: int):
         """
         Pad the Chebyshev coefficients with zeros for a prescribed refinement factor.
-        The old Nyquist modes (last row/col) are doubled because they move from
+        The old Nyquist mode (last element) is doubled because it moves from
         endpoint (c_k=2) to interior (c_k=1) in the finer basis.
         """
         n_x = cheb_coeffs.shape[0]
         padded = jnp.zeros((self.N_x * rho + 1))
-        return padded.at[:n_x].set(cheb_coeffs)
+        
+        # Copy all coefficients first
+        padded = padded.at[:n_x].set(cheb_coeffs)
+        
+        return padded
 
     def eval_laplacian(self, cheb_coeffs: jnp.ndarray):
         """
@@ -457,3 +465,78 @@ if __name__ == "__main__":
     grid_fine = ChebyshevGrid2D(0.0, 1.0, 0.0, 1.0, 32, 64)
     t1 = time.perf_counter()
     print(f"Fine grid construction: {t1 - t0:.6f} s")
+
+    print("\n" + "="*60)
+    print("Test 1: Padding a function")
+    print("="*60)
+    
+    # Simple polynomial function: u(x, y) = x^2 + y^2
+    u_test = lambda x, y: x**2 + y**2
+    
+    # Coarse grid
+    grid_coarse = ChebyshevGrid2D(0.0, 1.0, 0.0, 1.0, 8, 8)
+    u_coarse = u_test(grid_coarse.X, grid_coarse.Y)
+    coeffs_coarse = grid_coarse.compute_coeffs(u_coarse)
+    
+    # Fine grid
+    grid_fine_test = ChebyshevGrid2D(0.0, 1.0, 0.0, 1.0, 16, 16)
+    u_fine_exact = u_test(grid_fine_test.X, grid_fine_test.Y)
+    
+    # Pad coefficients and evaluate
+    coeffs_padded = grid_coarse.pad_coeffs(coeffs_coarse, grid_fine_test.n_y, grid_fine_test.n_x)
+    u_fine_padded = grid_fine_test.eval_function(coeffs_padded)
+    
+    error = jnp.max(jnp.abs(u_fine_padded - u_fine_exact))
+    print(f"Max error after padding: {error:.2e}")
+    print(f"Test {'PASSED' if error < 1e-10 else 'FAILED'}")
+    
+    print("\n" + "="*60)
+    print("Test 2: Commutativity of padding and differentiation")
+    print("="*60)
+    
+    # Use a simple function: u(x, y) = x^3 + y^3
+    u_test2 = lambda x, y: x**3 + y**3
+    du_dx_exact2 = lambda x, y: 3 * x**2
+    du_dy_exact2 = lambda x, y: 3 * y**2
+    
+    # Coarse and fine grids
+    grid_c = ChebyshevGrid2D(0.0, 1.0, 0.0, 1.0, 12, 8)
+    grid_f = ChebyshevGrid2D(0.0, 1.0, 0.0, 1.0, 24, 16)
+    
+    # Compute coefficients on coarse grid
+    u_c = u_test2(grid_c.X, grid_c.Y)
+    coeffs_c = grid_c.compute_coeffs(u_c)
+    
+    # Method 1: Differentiate then pad
+    dc_dx_c, dc_dy_c = grid_c.du_dx_coeff(coeffs_c), grid_c.du_dy_coeff(coeffs_c)
+    dc_dx_padded = grid_c.pad_coeffs(dc_dx_c, grid_f.n_y, grid_f.n_x)
+    dc_dy_padded = grid_c.pad_coeffs(dc_dy_c, grid_f.n_y, grid_f.n_x)
+    du_dx_method1 = grid_f.eval_function(dc_dx_padded)
+    du_dy_method1 = grid_f.eval_function(dc_dy_padded)
+    
+    # Method 2: Pad then differentiate
+    coeffs_padded2 = grid_c.pad_coeffs(coeffs_c, grid_f.n_y, grid_f.n_x)
+    dc_dx_padded2, dc_dy_padded2 = grid_f.du_dx_coeff(coeffs_padded2), grid_f.du_dy_coeff(coeffs_padded2)
+    du_dx_method2 = grid_f.eval_function(dc_dx_padded2)
+    du_dy_method2 = grid_f.eval_function(dc_dy_padded2)
+    
+    # Compare the two methods
+    error_dx = jnp.max(jnp.abs(du_dx_method1 - du_dx_method2))
+    error_dy = jnp.max(jnp.abs(du_dy_method1 - du_dy_method2))
+    
+    print(f"Max error in du/dx: {error_dx:.2e}")
+    print(f"Max error in du/dy: {error_dy:.2e}")
+    print(f"Test {'PASSED' if error_dx < 1e-10 and error_dy < 1e-10 else 'FAILED'}")
+    
+    # Also compare with exact solution on fine grid
+    du_dx_exact_f = du_dx_exact2(grid_f.X, grid_f.Y)
+    du_dy_exact_f = du_dy_exact2(grid_f.X, grid_f.Y)
+    
+    error_exact_dx = jnp.max(jnp.abs(du_dx_method1 - du_dx_exact_f))
+    error_exact_dy = jnp.max(jnp.abs(du_dy_method1 - du_dy_exact_f))
+    
+    print(f"\nComparison with exact solution:")
+    print(f"Max error in du/dx vs exact: {error_exact_dx:.2e}")
+    print(f"Max error in du/dy vs exact: {error_exact_dy:.2e}")
+
+    
