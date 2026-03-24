@@ -295,13 +295,7 @@ def train_model_gauss_newton_exact(
     maxiter=1000,
     log_every=100,
     grad_tol=1e-10,
-    damping=1e-3,
-    damping_factor=10.0,
-    min_damping=1e-12,
-    max_damping=1e12,
-    tr_rho_good=0.75,
-    tr_rho_bad=0.25,
-    max_damping_tries=20,
+    damping=1e-10,
     max_step_norm=None,
     fallback_step_size=1e-8,
     log_fn=None,
@@ -309,9 +303,9 @@ def train_model_gauss_newton_exact(
     """
     Train using damped Gauss-Newton / Levenberg-Marquardt on a residual vector r(params).
 
-    Loss: 0.5 * ||r||^2.  Steps are full LM steps (no line search).  The damping λ is
-    updated with a trust-region style rule (gain ratio ρ = actual / predicted reduction):
-    accept if ρ ≥ tr_rho_bad; decrease λ if ρ > tr_rho_good; reject and increase λ if ρ < tr_rho_bad.
+    Loss: 0.5 * ||r||^2.  Full LM steps (no line search) with **fixed** damping λ: each
+    iteration solves (J^T J + λ I) p = -J^T r.  The step is accepted if the loss decreases;
+    otherwise a tiny gradient step is taken.  Gain ratio ρ is logged when well-defined.
 
     Parameters
     ----------
@@ -326,23 +320,11 @@ def train_model_gauss_newton_exact(
     grad_tol : float
         Stop when the gradient norm drops below this value.
     damping : float
-        Initial Levenberg-Marquardt damping coefficient.
-    damping_factor : float
-        Multiplicative factor to increase/decrease damping on reject / strong agreement.
-    min_damping : float
-        Minimum allowable damping.
-    max_damping : float
-        Maximum allowable damping.
-    tr_rho_good : float
-        If gain ratio ρ exceeds this after an accepted step, decrease λ (expand step).
-    tr_rho_bad : float
-        If ρ is below this, reject the step and increase λ (shrink trust region).
-    max_damping_tries : int
-        Maximum λ adjustments per outer iteration before fallback gradient step.
+        Fixed Levenberg-Marquardt damping λ (added to the diagonal as λ I).
     max_step_norm : float or None
         If set, clip the LM step to this L2 norm for safety.
     fallback_step_size : float
-        Tiny gradient step if no acceptable LM step is found.
+        Tiny gradient step if the LM step does not decrease loss.
     log_fn : callable or None
         Optional user-supplied logging function with signature
             log_fn(params) -> dict[str, scalar]
@@ -351,8 +333,8 @@ def train_model_gauss_newton_exact(
         JIT-compiled internally, so it must be JAX-traceable.
     """
     print("=" * 80)
-    print("Training Model using Gauss-Newton (Levenberg-Marquardt)")
-    print(f"Maximum iterations: {maxiter}, Gradient tolerance: {grad_tol:.2e}, Initial damping: {damping:.2e}")
+    print("Training Model using Gauss-Newton (Levenberg-Marquardt, fixed damping)")
+    print(f"Maximum iterations: {maxiter}, Gradient tolerance: {grad_tol:.2e}, Damping λ: {damping:.2e}")
     print("=" * 80)
 
     def flatten_params(p):
@@ -401,7 +383,7 @@ def train_model_gauss_newton_exact(
     history["gain_ratio"] = [float("nan")]
     _print_diag("Initial", init_loss, init_grad_norm, init_user)
 
-    current_damping = float(damping)
+    lam_fixed = float(damping)
     start_time = time.time()
 
     for it in range(maxiter):
@@ -420,58 +402,31 @@ def train_model_gauss_newton_exact(
         Jtr = -grad
         JtJ = J.T @ J
 
-        step_found = False
+        lam = lam_fixed
+        H = JtJ + lam * jnp.eye(n_params, dtype=flat_params.dtype)
+        step = jnp.linalg.solve(H, Jtr)
+
+        if max_step_norm is not None:
+            step_norm = jnp.linalg.norm(step)
+            scale = jnp.minimum(1.0, max_step_norm / (step_norm + 1e-30))
+            step = step * scale
+
+        r_lin = r + J @ step
+        pred_loss = 0.5 * jnp.sum(r_lin * r_lin) + 0.5 * lam * jnp.dot(step, step)
+        predicted_reduction = loss - pred_loss
+
+        trial_flat = flat_params + step
+        trial_loss = loss_scalar(trial_flat)
+
         last_rho = float("nan")
-        new_flat = flat_params
-
-        for _try in range(max_damping_tries):
-            lam = current_damping
-            H = JtJ + lam * jnp.eye(n_params, dtype=flat_params.dtype)
-            step = jnp.linalg.solve(H, Jtr)
-
-            if max_step_norm is not None:
-                step_norm = jnp.linalg.norm(step)
-                scale = jnp.minimum(1.0, max_step_norm / (step_norm + 1e-30))
-                step = step * scale
-
-            # Predicted reduction from the LM quadratic model: m(p) = 0.5||r + Jp||^2 + 0.5*lam||p||^2
-            r_lin = r + J @ step
-            pred_loss = 0.5 * jnp.sum(r_lin * r_lin) + 0.5 * lam * jnp.dot(step, step)
-            predicted_reduction = loss - pred_loss
-
-            pred_pos = jnp.isfinite(predicted_reduction) & (predicted_reduction > 1e-30 * (jnp.abs(loss) + 1.0))
-            if not pred_pos:
-                current_damping = min(current_damping * damping_factor, max_damping)
-                continue
-
-            trial_flat = flat_params + step
-            trial_loss = loss_scalar(trial_flat)
-            actual_reduction = loss - trial_loss
-
-            if not jnp.isfinite(trial_loss):
-                current_damping = min(current_damping * damping_factor, max_damping)
-                continue
-
-            rho = actual_reduction / predicted_reduction
-
-            # Trust region: reject poor agreement, shrink λ schedule via larger damping
-            if rho < tr_rho_bad:
-                current_damping = min(current_damping * damping_factor, max_damping)
-                continue
-
-            # Accept full step
+        if jnp.isfinite(trial_loss) and trial_loss < loss:
             new_flat = trial_flat
-            step_found = True
-            last_rho = float(rho)
-            if rho > tr_rho_good:
-                current_damping = max(current_damping / damping_factor, min_damping)
-            break
-
-        if not step_found:
+            if jnp.isfinite(predicted_reduction) and float(predicted_reduction) > 1e-30 * (abs(float(loss)) + 1.0):
+                last_rho = float((loss - trial_loss) / predicted_reduction)
+        else:
             alpha = fallback_step_size
             new_flat = flat_params - alpha * grad
-            last_rho = float("nan")
-            print(f"Warning: no LM step accepted at iteration {it}; taking tiny gradient step alpha={alpha:g}")
+            print(f"Warning: LM step did not reduce loss at iteration {it}; taking tiny gradient step alpha={alpha:g}")
 
         params = unflatten_params(new_flat, treedef, template_leaves)
 
@@ -479,11 +434,11 @@ def train_model_gauss_newton_exact(
             loss_val, grad_norm_val, um = _run_diagnostics(params, jit_val_grad, jit_log)
             _append_history(history, loss_val, grad_norm_val, um)
             history["residual_norm"].append(float(jnp.sqrt(2.0 * loss_val)))
-            history["damping"].append(current_damping)
+            history["damping"].append(lam_fixed)
             history["gain_ratio"].append(last_rho)
             rho_str = "nan" if last_rho != last_rho else f"{last_rho:.3f}"
             _print_diag(
-                f"Iteration {it} (damping={current_damping:.2e}, rho={rho_str})",
+                f"Iteration {it} (damping={lam_fixed:.2e}, rho={rho_str})",
                 loss_val, grad_norm_val, um,
             )
 
@@ -494,7 +449,7 @@ def train_model_gauss_newton_exact(
     if abs(history["loss"][-1] - final_loss) > 1e-10:
         _append_history(history, final_loss, final_grad_norm, final_user)
         history["residual_norm"].append(float(jnp.sqrt(2.0 * final_loss)))
-        history["damping"].append(current_damping)
+        history["damping"].append(lam_fixed)
         history["gain_ratio"].append(float("nan"))
 
     print(f"\nGauss-Newton optimization completed in {total_time:.2f}s")
@@ -513,12 +468,6 @@ def train_model_gauss_newton_approx(
     log_every=100,
     grad_tol=1e-10,
     damping=1e-3,
-    damping_factor=2,
-    min_damping=1e-12,
-    max_damping=1e12,
-    tr_rho_good=0.75,
-    tr_rho_bad=0.25,
-    max_damping_tries=20,
     cg_tol=1e-2,
     cg_maxiter=100,
     max_step_norm=None,
@@ -529,9 +478,9 @@ def train_model_gauss_newton_approx(
     Train using matrix-free damped Gauss-Newton / Levenberg-Marquardt on a residual vector r(params).
 
     Loss: 0.5 * ||r||^2.  Never forms J or J^T J explicitly; uses JVP/VJP to apply
-    J and J^T to vectors and solves (J^T J + lam I) p = -J^T r with GMRES.
-    Full LM steps only (no line search); λ is updated via a trust-region gain ratio
-    ρ = actual / predicted reduction (see ``tr_rho_good`` / ``tr_rho_bad``).
+    J and J^T to vectors and solves (J^T J + λ I) p = -J^T r with GMRES.
+    **Fixed** damping λ each iteration.  The step is accepted if the loss decreases;
+    otherwise a tiny gradient step is taken.  Gain ratio ρ is logged when well-defined.
 
     Parameters
     ----------
@@ -546,19 +495,7 @@ def train_model_gauss_newton_approx(
     grad_tol : float
         Stop when the gradient norm drops below this value.
     damping : float
-        Initial Levenberg-Marquardt damping coefficient.
-    damping_factor : float
-        Multiplicative factor to increase/decrease damping on reject / strong agreement.
-    min_damping : float
-        Minimum allowable damping.
-    max_damping : float
-        Maximum allowable damping.
-    tr_rho_good : float
-        If gain ratio ρ exceeds this after an accepted step, decrease λ.
-    tr_rho_bad : float
-        If ρ is below this, reject the step and increase λ.
-    max_damping_tries : int
-        Maximum λ adjustments per outer iteration before fallback gradient step.
+        Fixed Levenberg-Marquardt damping λ (identity scaling on the diagonal in the operator).
     cg_tol : float
         Relative residual tolerance for the GMRES linear solve.
     cg_maxiter : int
@@ -566,7 +503,7 @@ def train_model_gauss_newton_approx(
     max_step_norm : float or None
         If set, clip the LM step to this L2 norm for safety.
     fallback_step_size : float
-        Tiny gradient step if no acceptable LM step is found.
+        Tiny gradient step if the LM step does not decrease loss.
     log_fn : callable or None
         Optional user-supplied logging function with signature
             log_fn(params) -> dict[str, scalar]
@@ -575,8 +512,8 @@ def train_model_gauss_newton_approx(
         JIT-compiled internally, so it must be JAX-traceable.
     """
     print("=" * 80)
-    print("Training Model using Gauss-Newton Approx (Matrix-Free Levenberg-Marquardt)")
-    print(f"Maximum iterations: {maxiter}, Gradient tolerance: {grad_tol:.2e}, Initial damping: {damping:.2e}")
+    print("Training Model using Gauss-Newton Approx (Matrix-Free LM, fixed damping)")
+    print(f"Maximum iterations: {maxiter}, Gradient tolerance: {grad_tol:.2e}, Damping λ: {damping:.2e}")
     print("=" * 80)
 
     def flatten_params(p):
@@ -636,7 +573,7 @@ def train_model_gauss_newton_approx(
     history["gain_ratio"] = [float("nan")]
     _print_diag("Initial", init_loss, init_grad_norm, init_user)
 
-    current_damping = float(damping)
+    lam_fixed = float(damping)
     start_time = time.time()
 
     for it in range(maxiter):
@@ -650,59 +587,34 @@ def train_model_gauss_newton_approx(
             break
 
         Jtr = -grad
-        step_found = False
+        lam = lam_fixed
+
+        def H(v, lam=lam):
+            return JT(J(v)) + lam * v
+
+        step = gmres(H, Jtr, tol=cg_tol, maxiter=cg_maxiter)[0]
+
+        if max_step_norm is not None:
+            step_norm = jnp.linalg.norm(step)
+            scale = jnp.minimum(1.0, max_step_norm / (step_norm + 1e-30))
+            step = step * scale
+
+        r_lin = r + J(step)
+        pred_loss = 0.5 * jnp.sum(r_lin * r_lin) + 0.5 * lam * jnp.dot(step, step)
+        predicted_reduction = loss - pred_loss
+
+        trial_flat = flat_params + step
+        trial_loss = loss_scalar(trial_flat)
+
         last_rho = float("nan")
-        new_flat = flat_params
-
-        for _try in range(max_damping_tries):
-            lam = current_damping
-
-            def H(v, lam=lam):
-                return JT(J(v)) + lam * v
-
-            step = gmres(H, Jtr, tol=cg_tol, maxiter=cg_maxiter)[0]
-
-            if max_step_norm is not None:
-                step_norm = jnp.linalg.norm(step)
-                scale = jnp.minimum(1.0, max_step_norm / (step_norm + 1e-30))
-                step = step * scale
-
-            # Predicted reduction from the LM quadratic model: m(p) = 0.5||r + Jp||^2 + 0.5*lam||p||^2
-            r_lin = r + J(step)
-            pred_loss = 0.5 * jnp.sum(r_lin * r_lin) + 0.5 * lam * jnp.dot(step, step)
-            predicted_reduction = loss - pred_loss
-
-            pred_pos = jnp.isfinite(predicted_reduction) & (predicted_reduction > 1e-30 * (jnp.abs(loss) + 1.0))
-            if not pred_pos:
-                current_damping = min(current_damping * damping_factor, max_damping)
-                continue
-
-            trial_flat = flat_params + step
-            trial_loss = loss_scalar(trial_flat)
-            actual_reduction = loss - trial_loss
-
-            if not jnp.isfinite(trial_loss):
-                current_damping = min(current_damping * damping_factor, max_damping)
-                continue
-
-            rho = actual_reduction / predicted_reduction
-
-            if rho < tr_rho_bad:
-                current_damping = min(current_damping * damping_factor, max_damping)
-                continue
-
+        if jnp.isfinite(trial_loss) and trial_loss < loss:
             new_flat = trial_flat
-            step_found = True
-            last_rho = float(rho)
-            if rho > tr_rho_good:
-                current_damping = max(current_damping / damping_factor, min_damping)
-            break
-
-        if not step_found:
+            if jnp.isfinite(predicted_reduction) and float(predicted_reduction) > 1e-30 * (abs(float(loss)) + 1.0):
+                last_rho = float((loss - trial_loss) / predicted_reduction)
+        else:
             alpha = fallback_step_size
             new_flat = flat_params - alpha * grad
-            last_rho = float("nan")
-            print(f"Warning: no LM step accepted at iteration {it}; taking tiny gradient step alpha={alpha:g}")
+            print(f"Warning: LM step did not reduce loss at iteration {it}; taking tiny gradient step alpha={alpha:g}")
 
         params = unflatten_params(new_flat, treedef, template_leaves)
 
@@ -710,11 +622,11 @@ def train_model_gauss_newton_approx(
             loss_val, grad_norm_val, um = _run_diagnostics(params, jit_val_grad, jit_log)
             _append_history(history, loss_val, grad_norm_val, um)
             history["residual_norm"].append(float(jnp.sqrt(2.0 * loss_val)))
-            history["damping"].append(current_damping)
+            history["damping"].append(lam_fixed)
             history["gain_ratio"].append(last_rho)
             rho_str = "nan" if last_rho != last_rho else f"{last_rho:.3f}"
             _print_diag(
-                f"Iteration {it} (damping={current_damping:.2e}, rho={rho_str})",
+                f"Iteration {it} (damping={lam_fixed:.2e}, rho={rho_str})",
                 loss_val, grad_norm_val, um,
             )
 
@@ -725,7 +637,7 @@ def train_model_gauss_newton_approx(
     if abs(history["loss"][-1] - final_loss) > 1e-10:
         _append_history(history, final_loss, final_grad_norm, final_user)
         history["residual_norm"].append(float(jnp.sqrt(2.0 * final_loss)))
-        history["damping"].append(current_damping)
+        history["damping"].append(lam_fixed)
         history["gain_ratio"].append(float("nan"))
 
     print(f"\nGauss-Newton Approx optimization completed in {total_time:.2f}s")
