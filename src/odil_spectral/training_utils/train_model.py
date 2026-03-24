@@ -4,6 +4,7 @@ import time
 from jaxopt import LBFGS
 import optax
 
+from jax.scipy.sparse.linalg import cg, gmres
 
 # ──────────────────────────────────────────────────────────────────────
 # Shared helpers
@@ -280,6 +281,454 @@ def train_model_adam(params, loss_fn, maxiter=50000, log_every=100, grad_tol=5e-
     _append_final(history, final_loss, final_grad_norm, final_user)
 
     print(f"\nAdam optimization completed in {total_time:.2f}s")
+    _print_diag("Final", final_loss, final_grad_norm, final_user)
+    print(f"Total logged steps: {len(history['loss']) - 1}")
+
+    history["total_time"] = total_time
+    history["log_every"] = log_every
+
+    return params, history
+
+def train_model_gauss_newton_exact(
+    params,
+    residual_fn,
+    maxiter=1000,
+    log_every=100,
+    grad_tol=1e-10,
+    damping=1e-3,
+    damping_factor=10.0,
+    min_damping=1e-12,
+    max_damping=1e12,
+    armijo_c=1e-6,
+    min_alpha=1e-8,
+    max_ls_steps=30,
+    max_damping_tries=20,
+    max_step_norm=None,
+    log_fn=None,
+):
+    """
+    Train using damped Gauss-Newton / Levenberg-Marquardt on a residual vector r(params).
+
+    Loss: 0.5 * ||r||^2.
+
+    Parameters
+    ----------
+    params : pytree
+        Initial parameters.
+    residual_fn : callable
+        Residual function of params returning a vector; loss = 0.5 * ||r||^2.
+    maxiter : int
+        Maximum number of iterations.
+    log_every : int
+        Compute and store diagnostics every this many iterations.
+    grad_tol : float
+        Stop when the gradient norm drops below this value.
+    damping : float
+        Initial Levenberg-Marquardt damping coefficient.
+    damping_factor : float
+        Multiplicative factor to increase/decrease damping.
+    min_damping : float
+        Minimum allowable damping.
+    max_damping : float
+        Maximum allowable damping.
+    armijo_c : float
+        Armijo sufficient-decrease constant for backtracking line search.
+    min_alpha : float
+        Minimum step size before aborting line search.
+    max_ls_steps : int
+        Maximum number of backtracking line search steps.
+    max_damping_tries : int
+        Maximum number of damping increases before giving up on an LM step.
+    max_step_norm : float or None
+        If set, clip the LM step to this L2 norm for safety.
+    log_fn : callable or None
+        Optional user-supplied logging function with signature
+            log_fn(params) -> dict[str, scalar]
+        Called every `log_every` iterations.  Each key becomes an entry
+        in the returned history (list of scalars).  The function is
+        JIT-compiled internally, so it must be JAX-traceable.
+    """
+    print("=" * 80)
+    print("Training Model using Gauss-Newton (Levenberg-Marquardt)")
+    print(f"Maximum iterations: {maxiter}, Gradient tolerance: {grad_tol:.2e}, Initial damping: {damping:.2e}")
+    print("=" * 80)
+
+    def flatten_params(p):
+        leaves, treedef = jax.tree_util.tree_flatten(p)
+        flat = jnp.concatenate([x.reshape(-1) for x in leaves]) if leaves else jnp.array([])
+        return flat, treedef, leaves
+
+    def unflatten_params(flat, treedef, template_leaves):
+        sizes = [x.size for x in template_leaves]
+        shapes = [x.shape for x in template_leaves]
+        out_leaves = []
+        idx = 0
+        for size, shape in zip(sizes, shapes):
+            out_leaves.append(flat[idx:idx + size].reshape(shape))
+            idx += size
+        return jax.tree_util.tree_unflatten(treedef, out_leaves)
+
+    flat0, treedef, template_leaves = flatten_params(params)
+    n_params = int(flat0.size)
+
+    @jax.jit
+    def residual_vector(flat_p):
+        p_dict = unflatten_params(flat_p, treedef, template_leaves)
+        return residual_fn(p_dict).reshape(-1)
+
+    @jax.jit
+    def loss_scalar(flat_p):
+        r = residual_vector(flat_p)
+        return 0.5 * jnp.sum(r * r)
+
+    def loss_fn_dict(p):
+        flat, _, _ = flatten_params(p)
+        return loss_scalar(flat)
+
+    grad_fn = jax.jit(jax.grad(loss_scalar))
+    jac_fn = jax.jit(jax.jacfwd(residual_vector))
+
+    jit_val_grad = jax.jit(jax.value_and_grad(loss_fn_dict))
+    jit_log = _jit_log_fn(log_fn)
+
+    # ---------- initial diagnostics ----------
+    init_loss, init_grad_norm, init_user = _run_diagnostics(params, jit_val_grad, jit_log)
+    history = _init_history(init_loss, init_grad_norm, init_user)
+    history["residual_norm"] = [float(jnp.sqrt(2.0 * init_loss))]
+    history["damping"] = [float(damping)]
+    history["alpha"] = [0.0]
+    _print_diag("Initial", init_loss, init_grad_norm, init_user)
+
+    current_damping = float(damping)
+    start_time = time.time()
+
+    for it in range(maxiter):
+        flat_params, _, _ = flatten_params(params)
+
+        r = residual_vector(flat_params)
+        loss = loss_scalar(flat_params)
+        grad = grad_fn(flat_params)
+        grad_norm = float(jnp.linalg.norm(grad))
+
+        if grad_norm < grad_tol:
+            print(f"\nConverged at iteration {it} with grad norm {grad_norm:.6e}")
+            break
+
+        J = jac_fn(flat_params)
+        Jtr = -grad
+        JtJ = J.T @ J
+
+        step_found = False
+        accepted_alpha = 0.0
+        new_flat = flat_params
+
+        for _try in range(max_damping_tries):
+            lam = current_damping
+            H = JtJ + lam * jnp.eye(n_params, dtype=flat_params.dtype)
+            step = jnp.linalg.solve(H, Jtr)
+
+            if max_step_norm is not None:
+                step_norm = jnp.linalg.norm(step)
+                scale = jnp.minimum(1.0, max_step_norm / (step_norm + 1e-30))
+                step = step * scale
+
+            # Predicted reduction from the LM quadratic model: m(p) = 0.5||r + Jp||^2 + 0.5*lam||p||^2
+            r_lin = r + J @ step
+            pred_loss = 0.5 * jnp.sum(r_lin * r_lin) + 0.5 * lam * jnp.dot(step, step)
+            predicted_reduction = loss - pred_loss
+
+            if not jnp.isfinite(predicted_reduction) or predicted_reduction <= 0:
+                current_damping = min(current_damping * damping_factor, max_damping)
+                continue
+
+            # Backtracking line search (Armijo condition)
+            alpha = 1.0
+            g2 = jnp.dot(grad, step)
+            accepted = False
+
+            for _ls in range(max_ls_steps):
+                trial_flat = flat_params + alpha * step
+                trial_loss = loss_scalar(trial_flat)
+
+                if jnp.isfinite(trial_loss) and trial_loss <= loss - armijo_c * alpha * g2:
+                    accepted = True
+                    new_flat = trial_flat
+                    accepted_alpha = alpha
+                    step_found = True
+                    break
+
+                alpha *= 0.5
+                if alpha < min_alpha:
+                    break
+
+            if accepted:
+                current_damping = max(current_damping / damping_factor, min_damping)
+                break
+            else:
+                current_damping = min(current_damping * damping_factor, max_damping)
+
+        if not step_found:
+            alpha = min_alpha
+            new_flat = flat_params - alpha * grad
+            accepted_alpha = alpha
+            print(f"Warning: no LM step accepted at iteration {it}; taking tiny gradient step alpha={alpha:g}")
+
+        params = unflatten_params(new_flat, treedef, template_leaves)
+
+        if it % log_every == 0 or it == maxiter - 1:
+            loss_val, grad_norm_val, um = _run_diagnostics(params, jit_val_grad, jit_log)
+            _append_history(history, loss_val, grad_norm_val, um)
+            history["residual_norm"].append(float(jnp.sqrt(2.0 * loss_val)))
+            history["damping"].append(current_damping)
+            history["alpha"].append(float(accepted_alpha))
+            _print_diag(
+                f"Iteration {it} (damping={current_damping:.2e}, alpha={float(accepted_alpha):.2e})",
+                loss_val, grad_norm_val, um,
+            )
+
+    total_time = time.time() - start_time
+
+    # ---------- final diagnostics ----------
+    final_loss, final_grad_norm, final_user = _run_diagnostics(params, jit_val_grad, jit_log)
+    if abs(history["loss"][-1] - final_loss) > 1e-10:
+        _append_history(history, final_loss, final_grad_norm, final_user)
+        history["residual_norm"].append(float(jnp.sqrt(2.0 * final_loss)))
+        history["damping"].append(current_damping)
+        history["alpha"].append(0.0)
+
+    print(f"\nGauss-Newton optimization completed in {total_time:.2f}s")
+    _print_diag("Final", final_loss, final_grad_norm, final_user)
+    print(f"Total logged steps: {len(history['loss']) - 1}")
+
+    history["total_time"] = total_time
+    history["log_every"] = log_every
+
+    return params, history
+
+def train_model_gauss_newton_approx(
+    params,
+    residual_fn,
+    maxiter=1000,
+    log_every=100,
+    grad_tol=1e-10,
+    damping=1e-3,
+    damping_factor=2,
+    min_damping=1e-6,
+    max_damping=1e12,
+    armijo_c=1e-6,
+    min_alpha=1e-8,
+    max_ls_steps=30,
+    max_damping_tries=20,
+    cg_tol=1e-2,
+    cg_maxiter=100,
+    max_step_norm=None,
+    log_fn=None,
+):
+    """
+    Train using matrix-free damped Gauss-Newton / Levenberg-Marquardt on a residual vector r(params).
+
+    Loss: 0.5 * ||r||^2.  Never forms J or J^T J explicitly; uses JVP/VJP to apply
+    J and J^T to vectors and solves (J^T J + lam I) p = -J^T r with GMRES.
+
+    Parameters
+    ----------
+    params : pytree
+        Initial parameters.
+    residual_fn : callable
+        Residual function of params returning a vector; loss = 0.5 * ||r||^2.
+    maxiter : int
+        Maximum number of iterations.
+    log_every : int
+        Compute and store diagnostics every this many iterations.
+    grad_tol : float
+        Stop when the gradient norm drops below this value.
+    damping : float
+        Initial Levenberg-Marquardt damping coefficient.
+    damping_factor : float
+        Multiplicative factor to increase/decrease damping.
+    min_damping : float
+        Minimum allowable damping.
+    max_damping : float
+        Maximum allowable damping.
+    armijo_c : float
+        Armijo sufficient-decrease constant for backtracking line search.
+    min_alpha : float
+        Minimum step size before aborting line search.
+    max_ls_steps : int
+        Maximum number of backtracking line search steps.
+    max_damping_tries : int
+        Maximum number of damping increases before giving up on an LM step.
+    cg_tol : float
+        Relative residual tolerance for the GMRES linear solve.
+    cg_maxiter : int
+        Maximum GMRES iterations per LM step.
+    max_step_norm : float or None
+        If set, clip the LM step to this L2 norm for safety.
+    log_fn : callable or None
+        Optional user-supplied logging function with signature
+            log_fn(params) -> dict[str, scalar]
+        Called every `log_every` iterations.  Each key becomes an entry
+        in the returned history (list of scalars).  The function is
+        JIT-compiled internally, so it must be JAX-traceable.
+    """
+    print("=" * 80)
+    print("Training Model using Gauss-Newton Approx (Matrix-Free Levenberg-Marquardt)")
+    print(f"Maximum iterations: {maxiter}, Gradient tolerance: {grad_tol:.2e}, Initial damping: {damping:.2e}")
+    print("=" * 80)
+
+    def flatten_params(p):
+        leaves, treedef = jax.tree_util.tree_flatten(p)
+        flat = jnp.concatenate([x.reshape(-1) for x in leaves]) if leaves else jnp.array([])
+        return flat, treedef, leaves
+
+    def unflatten_params(flat, treedef, template_leaves):
+        sizes = [x.size for x in template_leaves]
+        shapes = [x.shape for x in template_leaves]
+        out_leaves = []
+        idx = 0
+        for size, shape in zip(sizes, shapes):
+            out_leaves.append(flat[idx:idx + size].reshape(shape))
+            idx += size
+        return jax.tree_util.tree_unflatten(treedef, out_leaves)
+
+    flat0, treedef, template_leaves = flatten_params(params)
+
+    @jax.jit
+    def residual_vector(flat_p):
+        p_dict = unflatten_params(flat_p, treedef, template_leaves)
+        return residual_fn(p_dict).reshape(-1)
+
+    @jax.jit
+    def loss_scalar(flat_p):
+        r = residual_vector(flat_p)
+        return 0.5 * jnp.sum(r * r)
+
+    def loss_fn_dict(p):
+        flat, _, _ = flatten_params(p)
+        return loss_scalar(flat)
+
+    def build_ops_at(params_flat):
+        """Build matrix-free J and J^T operators via JVP/VJP at the current point."""
+        r = residual_vector(params_flat)
+        loss = 0.5 * jnp.sum(r * r)
+        _, pullback = jax.vjp(residual_vector, params_flat)
+
+        def JT(u):
+            return pullback(u)[0]
+
+        def J(v):
+            return jax.jvp(residual_vector, (params_flat,), (v,))[1]
+
+        g = JT(r)
+        return r, loss, g, J, JT
+
+    jit_val_grad = jax.jit(jax.value_and_grad(loss_fn_dict))
+    jit_log = _jit_log_fn(log_fn)
+
+    # ---------- initial diagnostics ----------
+    init_loss, init_grad_norm, init_user = _run_diagnostics(params, jit_val_grad, jit_log)
+    history = _init_history(init_loss, init_grad_norm, init_user)
+    history["residual_norm"] = [float(jnp.sqrt(2.0 * init_loss))]
+    history["damping"] = [float(damping)]
+    history["alpha"] = [0.0]
+    _print_diag("Initial", init_loss, init_grad_norm, init_user)
+
+    current_damping = float(damping)
+    start_time = time.time()
+
+    for it in range(maxiter):
+        flat_params, _, _ = flatten_params(params)
+
+        r, loss, grad, J, JT = build_ops_at(flat_params)
+        grad_norm = float(jnp.linalg.norm(grad))
+
+        if grad_norm < grad_tol:
+            print(f"\nConverged at iteration {it} with grad norm {grad_norm:.6e}")
+            break
+
+        Jtr = -grad
+        step_found = False
+        accepted_alpha = 0.0
+        new_flat = flat_params
+
+        for _try in range(max_damping_tries):
+            lam = current_damping
+
+            def H(v, lam=lam):
+                return JT(J(v)) + lam * v
+
+            step = gmres(H, Jtr, tol=cg_tol, maxiter=cg_maxiter)[0]
+
+            if max_step_norm is not None:
+                step_norm = jnp.linalg.norm(step)
+                scale = jnp.minimum(1.0, max_step_norm / (step_norm + 1e-30))
+                step = step * scale
+
+            # Predicted reduction from the LM quadratic model: m(p) = 0.5||r + Jp||^2 + 0.5*lam||p||^2
+            r_lin = r + J(step)
+            pred_loss = 0.5 * jnp.sum(r_lin * r_lin) + 0.5 * lam * jnp.dot(step, step)
+            predicted_reduction = loss - pred_loss
+
+            if not jnp.isfinite(predicted_reduction) or predicted_reduction <= 0:
+                current_damping = min(current_damping * damping_factor, max_damping)
+                continue
+
+            # Backtracking line search (Armijo condition)
+            alpha = 1.0
+            g2 = -jnp.dot(grad, step)
+            accepted = False
+
+            for _ls in range(max_ls_steps):
+                trial_flat = flat_params + alpha * step
+                trial_loss = loss_scalar(trial_flat)
+
+                if jnp.isfinite(trial_loss) and trial_loss <= loss - armijo_c * alpha * g2:
+                    accepted = True
+                    new_flat = trial_flat
+                    accepted_alpha = alpha
+                    step_found = True
+                    break
+
+                alpha *= 0.5
+                if alpha < min_alpha:
+                    break
+
+            if accepted:
+                current_damping = max(current_damping / damping_factor, min_damping)
+                break
+            else:
+                current_damping = min(current_damping * damping_factor, max_damping)
+
+        if not step_found:
+            alpha = min_alpha
+            new_flat = flat_params - alpha * grad
+            accepted_alpha = alpha
+            print(f"Warning: no LM step accepted at iteration {it}; taking tiny gradient step alpha={alpha:g}")
+
+        params = unflatten_params(new_flat, treedef, template_leaves)
+
+        if it % log_every == 0 or it == maxiter - 1:
+            loss_val, grad_norm_val, um = _run_diagnostics(params, jit_val_grad, jit_log)
+            _append_history(history, loss_val, grad_norm_val, um)
+            history["residual_norm"].append(float(jnp.sqrt(2.0 * loss_val)))
+            history["damping"].append(current_damping)
+            history["alpha"].append(float(accepted_alpha))
+            _print_diag(
+                f"Iteration {it} (damping={current_damping:.2e}, alpha={float(accepted_alpha):.2e})",
+                loss_val, grad_norm_val, um,
+            )
+
+    total_time = time.time() - start_time
+
+    # ---------- final diagnostics ----------
+    final_loss, final_grad_norm, final_user = _run_diagnostics(params, jit_val_grad, jit_log)
+    if abs(history["loss"][-1] - final_loss) > 1e-10:
+        _append_history(history, final_loss, final_grad_norm, final_user)
+        history["residual_norm"].append(float(jnp.sqrt(2.0 * final_loss)))
+        history["damping"].append(current_damping)
+        history["alpha"].append(0.0)
+
+    print(f"\nGauss-Newton Approx optimization completed in {total_time:.2f}s")
     _print_diag("Final", final_loss, final_grad_norm, final_user)
     print(f"Total logged steps: {len(history['loss']) - 1}")
 
