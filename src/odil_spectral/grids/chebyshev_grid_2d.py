@@ -239,6 +239,52 @@ class ChebyshevGrid1D:
 
         return A.astype(self.dtype)
 
+    def make_evaluation_operator(self, x_eval):
+        """
+        Barycentric interpolation from grid values to arbitrary physical points.
+
+        Parameters
+        ----------
+        x_eval : (p,) array
+            Physical x-coordinates where values are desired.
+
+        Returns
+        -------
+        evaluation_operator : callable
+            ``evaluation_operator(val_cheb_grid)`` with ``val_cheb_grid`` shape (n_x,)
+            returns values at ``x_eval`` with shape (p,).
+        """
+        x_ref = 1.0 - 2.0 * (x_eval - self.x_start) / (self.x_end - self.x_start)
+
+        def barycentric_weights_chebyshev(n):
+            w = jnp.ones(n)
+            w = w.at[0].set(0.5)
+            w = w.at[-1].set(0.5)
+            signs = jnp.array([(-1) ** i for i in range(n)])
+            return w * signs
+
+        w1 = barycentric_weights_chebyshev(len(self._nodes_x_ref))
+
+        def barycentric_interpolate(x_nodes, f_nodes, x_eval_pts, weights):
+            # x_eval_pts: (p,), x_nodes: (n,), f_nodes: (n,)
+            diff = x_eval_pts[:, None] - x_nodes[None, :]
+            exact = jnp.abs(diff) < 1e-12
+            diff = jnp.where(exact, 1.0, diff)
+            w_over_d = weights[None, :] / diff
+            numerator = w_over_d @ f_nodes
+            denominator = jnp.sum(w_over_d, axis=1)
+            result = numerator / denominator
+            exact_idx = jnp.argmax(exact, axis=1)
+            hit_any = jnp.any(exact, axis=1)
+            return jnp.where(hit_any, f_nodes[exact_idx], result)
+
+        def evaluation_operator(val_cheb_grid):
+            return barycentric_interpolate(
+                self._nodes_x_ref, val_cheb_grid, x_ref, w1
+            )
+
+        return evaluation_operator
+
     def compute_coeffs(self, f_grid: jnp.ndarray) -> jnp.ndarray:
         return dct1_nd(f_grid) / self._norm_x
 
@@ -255,25 +301,25 @@ class ChebyshevGrid1D:
         du_dx : (n_x) array of physical-space derivatives
         """
 
-        # Differentiate along y (axis 0): vmap over columns
+        # Differentiate along x
         dc_dx = self.du_dx_coeff(cheb_coeffs)
         du_dx = self.eval_function(dc_dx)
 
         return du_dx
 
-    def pad_coeffs(self, cheb_coeffs: jnp.ndarray, rho: int):
+    def pad_coeffs(self, cheb_coeffs, n_x_new):
+        assert n_x_new >= self.n_x
+        padded = jnp.zeros((n_x_new,)).at[: self.n_x].set(cheb_coeffs)
+
+        return padded
+
+    def pad_coeffs_rho(self, cheb_coeffs: jnp.ndarray, rho: int):
         """
         Pad the Chebyshev coefficients with zeros for a prescribed refinement factor.
-        The old Nyquist mode (last element) is doubled because it moves from
+        The old Nyquist mode (last coefficient) is doubled because it moves from
         endpoint (c_k=2) to interior (c_k=1) in the finer basis.
         """
-        n_x = cheb_coeffs.shape[0]
-        padded = jnp.zeros((self.N_x * rho + 1))
-        
-        # Copy all coefficients first
-        padded = padded.at[:n_x].set(cheb_coeffs)
-        
-        return padded
+        return self.pad_coeffs(cheb_coeffs, self.N_x * rho + 1)
 
     def eval_laplacian(self, cheb_coeffs: jnp.ndarray):
         """
