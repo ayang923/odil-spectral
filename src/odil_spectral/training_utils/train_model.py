@@ -462,7 +462,8 @@ def train_model_gauss_newton_exact(
                     break
 
             if accepted:
-                current_damping = max(current_damping / damping_factor, min_damping)
+                if accepted_alpha >= 1.0 - 1e-10:
+                    current_damping = max(current_damping / damping_factor, min_damping)
                 break
             else:
                 current_damping = min(current_damping * damping_factor, max_damping)
@@ -694,7 +695,8 @@ def train_model_gauss_newton_approx(
                     break
 
             if accepted:
-                current_damping = max(current_damping / damping_factor, min_damping)
+                if accepted_alpha >= 1.0 - 1e-10:
+                    current_damping = max(current_damping / damping_factor, min_damping)
                 break
             else:
                 current_damping = min(current_damping * damping_factor, max_damping)
